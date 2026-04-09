@@ -2,18 +2,23 @@
  * @since 4.0.0
  */
 import type { NonEmptyReadonlyArray } from "effect/Array"
+import * as Context from "effect/Context"
 import * as Data from "effect/Data"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import type { Inspectable } from "effect/Inspectable"
 import { BaseProto } from "effect/Inspectable"
+import type * as MutableRef from "effect/MutableRef"
+import * as Option from "effect/Option"
 import * as Pipeable from "effect/Pipeable"
 import type * as Queue from "effect/Queue"
 import type * as Record from "effect/Record"
+import * as References from "effect/References"
 import * as Schema from "effect/Schema"
 import * as SchemaIssue from "effect/SchemaIssue"
 import * as SchemaParser from "effect/SchemaParser"
 import type * as Scope from "effect/Scope"
-import type * as Stream from "effect/Stream"
+import * as Stream from "effect/Stream"
 import type * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as Utils from "effect/Utils"
 import type * as IndexedDb from "./IndexedDb.ts"
@@ -73,7 +78,7 @@ export interface IndexedDbQueryBuilder<
   Source extends IndexedDbVersion.AnyWithProps
 > extends Pipeable.Pipeable, Inspectable {
   readonly tables: ReadonlyMap<string, IndexedDbVersion.Tables<Source>>
-  readonly database: globalThis.IDBDatabase
+  readonly database: MutableRef.MutableRef<globalThis.IDBDatabase>
   readonly reactivity: Reactivity.Reactivity["Service"]
   readonly IDBKeyRange: typeof globalThis.IDBKeyRange
   readonly IDBTransaction: globalThis.IDBTransaction | undefined
@@ -92,27 +97,16 @@ export interface IndexedDbQueryBuilder<
 
   readonly clearAll: Effect.Effect<void, IndexedDbQueryError>
 
-  readonly transaction: <
+  readonly withTransaction: <
     Tables extends NonEmptyReadonlyArray<
       IndexedDbTable.TableName<IndexedDbVersion.Tables<Source>>
     >,
-    Mode extends "readonly" | "readwrite",
-    E,
-    R
-  >(
-    tables: Tables,
-    mode: Mode,
-    callback: (api: {
-      readonly from: <Name extends Tables[number]>(
-        table: Name
-      ) => Mode extends "readwrite" ? IndexedDbQuery.From<IndexedDbVersion.TableWithName<Source, Name>>
-        : Omit<
-          IndexedDbQuery.From<IndexedDbVersion.TableWithName<Source, Name>>,
-          "insert" | "insertAll" | "upsert" | "upsertAll" | "clear" | "delete"
-        >
-    }) => Effect.Effect<void, E, R>,
-    options?: globalThis.IDBTransactionOptions
-  ) => Effect.Effect<void, never, R>
+    Mode extends "readonly" | "readwrite"
+  >(options: {
+    readonly tables: Tables
+    readonly mode: Mode
+    readonly durability?: IDBTransactionDurability
+  }) => <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, Exclude<R, IndexedDbTransaction>>
 }
 
 /**
@@ -140,7 +134,7 @@ export declare namespace IndexedDbQuery {
    * @since 4.0.0
    * @category models
    */
-  export type SourceTableSelectSchemaType<
+  export type SelectType<
     Table extends IndexedDbTable.AnyWithProps
   > = [IndexedDbTable.KeyPath<Table>] extends [undefined] ? IndexedDbTable.TableSchema<Table>["Type"] & {
       readonly key: (typeof IndexedDb.IDBValidKey)["Type"]
@@ -151,7 +145,7 @@ export declare namespace IndexedDbQuery {
    * @since 4.0.0
    * @category models
    */
-  export type SourceTableModifySchemaType<
+  export type ModifyType<
     Table extends IndexedDbTable.AnyWithProps
   > =
     & (IndexedDbTable.AutoIncrement<Table> extends true ?
@@ -183,21 +177,36 @@ export declare namespace IndexedDbQuery {
    * @since 4.0.0
    * @category models
    */
-  export type ExtractIndexType<
+  export type EqualsType<
     Table extends IndexedDbTable.AnyWithProps,
-    Index extends IndexedDbDatabase.IndexFromTable<Table>
-  > = [Index] extends [never] ? Schema.Schema.Type<
-      IndexedDbTable.TableSchema<Table>
-    >[IndexedDbTable.KeyPath<Table>]
-    : Schema.Schema.Type<
-      IndexedDbTable.TableSchema<Table>
-    >[IndexedDbTable.Indexes<Table>[Index]]
+    Index extends keyof Table["indexes"],
+    KeyPath = [Index] extends [never] ? Table["keyPath"] : Table["indexes"][Index],
+    Type = Table["tableSchema"]["Encoded"]
+  > = KeyPath extends keyof Type ? Type[KeyPath]
+    : { [I in keyof KeyPath]: KeyPath[I] extends keyof Type ? Type[KeyPath[I]] | [] : never }
 
   /**
    * @since 4.0.0
    * @category models
    */
-  export type ModifyWithKey<Table extends IndexedDbTable.AnyWithProps> = SourceTableModifySchemaType<Table>
+  export type ExtractIndexType<
+    Table extends IndexedDbTable.AnyWithProps,
+    Index extends keyof Table["indexes"],
+    KeyPath = [Index] extends [never] ? Table["keyPath"] : Table["indexes"][Index],
+    Type = Table["tableSchema"]["Encoded"]
+  > = KeyPath extends keyof Type ? Type[KeyPath]
+    : KeyPath extends readonly [infer K, ...infer Rest] ? K extends keyof Type ? [
+          Type[K],
+          ...{ [P in keyof Rest]?: Rest[P] extends keyof Type ? Type[Rest[P]] | [] : never }
+        ] :
+      never :
+    never
+
+  /**
+   * @since 4.0.0
+   * @category models
+   */
+  export type ModifyWithKey<Table extends IndexedDbTable.AnyWithProps> = ModifyType<Table>
 
   /**
    * @since 4.0.0
@@ -205,9 +214,8 @@ export declare namespace IndexedDbQuery {
    */
   export interface From<Table extends IndexedDbTable.AnyWithProps> {
     readonly table: Table
-    readonly database: globalThis.IDBDatabase
+    readonly database: MutableRef.MutableRef<globalThis.IDBDatabase>
     readonly IDBKeyRange: typeof globalThis.IDBKeyRange
-    readonly transaction?: globalThis.IDBTransaction
     readonly reactivity: Reactivity.Reactivity["Service"]
 
     readonly clear: Effect.Effect<void, IndexedDbQueryError>
@@ -253,6 +261,8 @@ export declare namespace IndexedDbQuery {
     readonly from: From<Table>
   }
 
+  type ComparisonKeys = "equals" | "gte" | "lte" | "gt" | "lt" | "between"
+
   /**
    * @since 4.0.0
    * @category models
@@ -268,51 +278,32 @@ export declare namespace IndexedDbQuery {
     readonly upperBound?: ExtractIndexType<Table, Index>
     readonly excludeLowerBound?: boolean
     readonly excludeUpperBound?: boolean
-    readonly limitValue?: number | undefined
 
     readonly equals: (
-      value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Count<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+      value: EqualsType<Table, Index>
+    ) => Omit<Count<Table, Index>, ComparisonKeys>
 
     readonly gte: (
       value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Count<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => Omit<Count<Table, Index>, ComparisonKeys>
 
     readonly lte: (
       value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Count<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => Omit<Count<Table, Index>, ComparisonKeys>
 
     readonly gt: (
       value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Count<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => Omit<Count<Table, Index>, ComparisonKeys>
 
     readonly lt: (
       value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Count<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => Omit<Count<Table, Index>, ComparisonKeys>
 
     readonly between: (
       lowerBound: ExtractIndexType<Table, Index>,
       upperBound: ExtractIndexType<Table, Index>,
       options?: { excludeLowerBound?: boolean; excludeUpperBound?: boolean }
-    ) => Omit<
-      Count<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => Omit<Count<Table, Index>, ComparisonKeys>
   }
 
   /**
@@ -327,56 +318,41 @@ export declare namespace IndexedDbQuery {
     readonly index?: Index
 
     readonly equals: (
-      value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Delete<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+      value: EqualsType<Table, Index>
+    ) => Delete<Table, Index>
 
     readonly gte: (
       value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Delete<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => Delete<Table, Index>
 
     readonly lte: (
       value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Delete<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => Delete<Table, Index>
 
     readonly gt: (
       value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Delete<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => Delete<Table, Index>
 
     readonly lt: (
       value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Delete<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => Delete<Table, Index>
 
     readonly between: (
       lowerBound: ExtractIndexType<Table, Index>,
       upperBound: ExtractIndexType<Table, Index>,
       options?: { excludeLowerBound?: boolean; excludeUpperBound?: boolean }
-    ) => Omit<
-      Delete<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => Delete<Table, Index>
 
     readonly limit: (
       limit: number
-    ) => Omit<
-      Delete<Table, Index>,
-      "limit" | "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => DeleteWithout<Table, Index, "limit">
   }
+
+  type DeleteWithout<
+    Table extends IndexedDbTable.AnyWithProps,
+    Index extends IndexedDbDatabase.IndexFromTable<Table>,
+    ExcludedKeys extends string
+  > = Omit<Delete<Table, Index, ExcludedKeys>, ExcludedKeys>
 
   /**
    * @since 4.0.0
@@ -384,7 +360,8 @@ export declare namespace IndexedDbQuery {
    */
   export interface Delete<
     Table extends IndexedDbTable.AnyWithProps,
-    Index extends IndexedDbDatabase.IndexFromTable<Table>
+    Index extends IndexedDbDatabase.IndexFromTable<Table>,
+    ExcludedKeys extends string = never
   > extends Pipeable.Pipeable, Effect.YieldableClass<void, IndexedDbQueryError> {
     readonly delete: DeletePartial<Table, Index>
     readonly index?: Index
@@ -396,60 +373,13 @@ export declare namespace IndexedDbQuery {
     readonly excludeUpperBound?: boolean
     readonly predicate?: (item: IndexedDbTable.Encoded<Table>) => boolean
 
-    readonly equals: (
-      value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Delete<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
-
-    readonly gte: (
-      value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Delete<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
-
-    readonly lte: (
-      value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Delete<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
-
-    readonly gt: (
-      value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Delete<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
-
-    readonly lt: (
-      value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Delete<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
-
-    readonly between: (
-      lowerBound: ExtractIndexType<Table, Index>,
-      upperBound: ExtractIndexType<Table, Index>,
-      options?: { excludeLowerBound?: boolean; excludeUpperBound?: boolean }
-    ) => Omit<
-      Delete<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
-
     readonly limit: (
       limit: number
-    ) => Omit<
-      Delete<Table, Index>,
-      "limit" | "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => DeleteWithout<Table, Index, ExcludedKeys | "limit">
 
     readonly filter: (
       f: (value: IndexedDbTable.Encoded<Table>) => boolean
-    ) => Delete<Table, Index>
+    ) => DeleteWithout<Table, Index, ExcludedKeys>
 
     /**
      * Invalidate any queries using Reactivity service with the provided keys.
@@ -461,17 +391,24 @@ export declare namespace IndexedDbQuery {
     ) => Effect.Effect<void, IndexedDbQueryError, IndexedDbTable.Context<Table>>
   }
 
+  type SelectWithout<
+    Table extends IndexedDbTable.AnyWithProps,
+    Index extends IndexedDbDatabase.IndexFromTable<Table>,
+    ExcludedKeys extends string
+  > = Omit<Select<Table, Index, ExcludedKeys>, ExcludedKeys>
+
   /**
    * @since 4.0.0
    * @category models
    */
   export interface Select<
     Table extends IndexedDbTable.AnyWithProps,
-    Index extends IndexedDbDatabase.IndexFromTable<Table>
+    Index extends IndexedDbDatabase.IndexFromTable<Table>,
+    ExcludedKeys extends string = never
   > extends
     Pipeable.Pipeable,
     Effect.YieldableClass<
-      Array<SourceTableSelectSchemaType<Table>>,
+      Array<SelectType<Table>>,
       IndexedDbQueryError,
       IndexedDbTable.Context<Table>
     >
@@ -479,6 +416,8 @@ export declare namespace IndexedDbQuery {
     readonly from: From<Table>
     readonly index?: Index
     readonly limitValue?: number
+    readonly offsetValue?: number
+    readonly reverseValue?: boolean
     readonly only?: ExtractIndexType<Table, Index>
     readonly lowerBound?: ExtractIndexType<Table, Index>
     readonly upperBound?: ExtractIndexType<Table, Index>
@@ -487,61 +426,59 @@ export declare namespace IndexedDbQuery {
     readonly predicate?: (item: IndexedDbTable.Encoded<Table>) => boolean
 
     readonly equals: (
-      value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Select<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+      value: EqualsType<Table, Index>
+    ) => SelectWithout<Table, Index, ExcludedKeys | ComparisonKeys>
 
     readonly gte: (
       value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Select<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => SelectWithout<Table, Index, ExcludedKeys | ComparisonKeys>
 
     readonly lte: (
       value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Select<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => SelectWithout<Table, Index, ExcludedKeys | ComparisonKeys>
 
     readonly gt: (
       value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Select<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => SelectWithout<Table, Index, ExcludedKeys | ComparisonKeys>
 
     readonly lt: (
       value: ExtractIndexType<Table, Index>
-    ) => Omit<
-      Select<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => SelectWithout<Table, Index, ExcludedKeys | ComparisonKeys>
 
     readonly between: (
       lowerBound: ExtractIndexType<Table, Index>,
       upperBound: ExtractIndexType<Table, Index>,
       options?: { excludeLowerBound?: boolean; excludeUpperBound?: boolean }
-    ) => Omit<
-      Select<Table, Index>,
-      "equals" | "gte" | "lte" | "gt" | "lt" | "between"
-    >
+    ) => SelectWithout<Table, Index, ExcludedKeys | ComparisonKeys>
 
     readonly limit: (
       limit: number
-    ) => Omit<
-      Select<Table, Index>,
-      "limit" | "equals" | "gte" | "lte" | "gt" | "lt" | "between" | "first"
-    >
+    ) => SelectWithout<Table, Index, ExcludedKeys | "limit" | "first">
+
+    readonly offset: (
+      offset: number
+    ) => SelectWithout<Table, Index, ExcludedKeys | "offset" | "first">
+
+    readonly reverse: () => SelectWithout<Table, Index, ExcludedKeys | "reverse" | "first">
 
     readonly filter: (
       f: (value: IndexedDbTable.Encoded<Table>) => boolean
-    ) => Select<Table, Index>
+    ) => SelectWithout<Table, Index, ExcludedKeys | "first">
 
     readonly first: () => First<Table, Index>
+
+    /**
+     * Stream the selected data.
+     *
+     * Defaults to a chunk size of 100.
+     */
+    readonly stream: (options?: {
+      readonly chunkSize?: number | undefined
+    }) => Stream.Stream<
+      SelectType<Table>,
+      IndexedDbQueryError,
+      IndexedDbTable.Context<Table>
+    >
 
     /**
      * Use the Reactivity service to react to changes to the selected data.
@@ -551,14 +488,14 @@ export declare namespace IndexedDbQuery {
     readonly reactive: (
       keys?: ReadonlyArray<unknown> | Record.ReadonlyRecord<string, ReadonlyArray<unknown>> | undefined
     ) => Stream.Stream<
-      Array<SourceTableSelectSchemaType<Table>>,
+      Array<SelectType<Table>>,
       IndexedDbQueryError,
       IndexedDbTable.Context<Table>
     >
     readonly reactiveQueue: (
       keys?: ReadonlyArray<unknown> | Record.ReadonlyRecord<string, ReadonlyArray<unknown>> | undefined
     ) => Effect.Effect<
-      Queue.Dequeue<Array<SourceTableSelectSchemaType<Table>>, IndexedDbQueryError>,
+      Queue.Dequeue<Array<SelectType<Table>>, IndexedDbQueryError>,
       never,
       Scope.Scope | IndexedDbTable.Context<Table>
     >
@@ -574,7 +511,7 @@ export declare namespace IndexedDbQuery {
   > extends
     Pipeable.Pipeable,
     Effect.YieldableClass<
-      SourceTableSelectSchemaType<Table>,
+      SelectType<Table>,
       IndexedDbQueryError,
       IndexedDbTable.Context<Table>
     >
@@ -589,7 +526,7 @@ export declare namespace IndexedDbQuery {
     readonly reactive: (
       keys?: ReadonlyArray<unknown> | Record.ReadonlyRecord<string, ReadonlyArray<unknown>> | undefined
     ) => Stream.Stream<
-      SourceTableSelectSchemaType<Table>,
+      SelectType<Table>,
       IndexedDbQueryError,
       IndexedDbTable.Context<Table>
     >
@@ -602,7 +539,7 @@ export declare namespace IndexedDbQuery {
     readonly reactiveQueue: (
       keys: ReadonlyArray<unknown> | Record.ReadonlyRecord<string, ReadonlyArray<unknown>>
     ) => Effect.Effect<
-      Queue.Dequeue<SourceTableSelectSchemaType<Table>, IndexedDbQueryError>,
+      Queue.Dequeue<SelectType<Table>, IndexedDbQueryError>,
       never,
       Scope.Scope | IndexedDbTable.Context<Table>
     >
@@ -618,7 +555,7 @@ export declare namespace IndexedDbQuery {
   > extends
     Pipeable.Pipeable,
     Effect.YieldableClass<
-      Array<SourceTableSelectSchemaType<Table>>,
+      Array<SelectType<Table>>,
       IndexedDbQueryError,
       IndexedDbTable.Context<Table>
     >
@@ -687,6 +624,14 @@ export declare namespace IndexedDbQuery {
   }
 }
 
+/**
+ * @since 4.0.0
+ * @category models
+ */
+export class IndexedDbTransaction extends Context.Service<IndexedDbTransaction, globalThis.IDBTransaction>()(
+  "@effect/platform-browser/IndexedDbQueryBuilder/IndexedDbTransaction"
+) {}
+
 // -----------------------------------------------------------------------------
 // internal
 // -----------------------------------------------------------------------------
@@ -709,8 +654,7 @@ const applyDelete = (query: IndexedDbQuery.Delete<any, never>) =>
   Effect.callback<any, IndexedDbQueryError>((resume) => {
     const database = query.delete.from.database
     const IDBKeyRange = query.delete.from.IDBKeyRange
-    let transaction = query.delete.from.transaction
-    transaction ??= database.transaction([query.delete.from.table.tableName], "readwrite", {
+    const transaction = getOrCreateTransaction(database.current, [query.delete.from.table.tableName], "readwrite", {
       durability: query.delete.from.table.durability
     })
     const objectStore = transaction.objectStore(query.delete.from.table.tableName)
@@ -815,7 +759,7 @@ const getReadonlyObjectStore = (
 ) => {
   const database = query.from.database
   const IDBKeyRange = query.from.IDBKeyRange
-  const transaction = query.from.transaction ?? database.transaction([query.from.table.tableName], "readonly", {
+  const transaction = getOrCreateTransaction(database.current, [query.from.table.tableName], "readonly", {
     durability: query.from.table.durability
   })
   const objectStore = transaction.objectStore(query.from.table.tableName)
@@ -853,19 +797,20 @@ const getReadonlyObjectStore = (
   return { store, keyRange }
 }
 
-const getSelect = Effect.fnUntraced(function*(
-  query: IndexedDbQuery.Select<any, never>
-) {
+const applySelect = Effect.fnUntraced(function*(
+  query: IndexedDbQuery.Select<any, never, any>
+): Effect.fn.Return<Array<any>, IndexedDbQueryError, unknown> {
   const keyPath = query.from.table.keyPath
   const predicate = query.predicate
 
-  const data = predicate || keyPath === undefined ?
-    yield* Effect.callback<any, IndexedDbQueryError>((resume) => {
+  const data = predicate || keyPath === undefined || query.offsetValue !== undefined ?
+    yield* Effect.callback<Array<any>, IndexedDbQueryError>((resume) => {
       const { keyRange, store } = getReadonlyObjectStore(query)
 
-      const cursorRequest = store.openCursor(keyRange)
+      const cursorRequest = store.openCursor(keyRange, query.reverseValue ? "prev" : "next")
       const results: Array<any> = []
       let count = 0
+      let offsetApplied = false
 
       cursorRequest.onerror = () => {
         resume(
@@ -884,6 +829,11 @@ const getSelect = Effect.fnUntraced(function*(
           return resume(Effect.succeed(results))
         }
 
+        if (query.offsetValue && !offsetApplied) {
+          offsetApplied = true
+          return cursor.advance(query.offsetValue)
+        }
+
         if (predicate === undefined || predicate(cursor.value)) {
           results.push(
             keyPath === undefined
@@ -900,7 +850,7 @@ const getSelect = Effect.fnUntraced(function*(
         resume(Effect.succeed(results))
       }
     }) :
-    yield* Effect.callback<any, IndexedDbQueryError>((resume) => {
+    yield* Effect.callback<Array<any>, IndexedDbQueryError>((resume) => {
       const { keyRange, store } = getReadonlyObjectStore(query)
       const request = store.getAll(keyRange, query.limitValue)
       request.onerror = (event) => {
@@ -914,6 +864,9 @@ const getSelect = Effect.fnUntraced(function*(
         )
       }
       request.onsuccess = () => {
+        if (query.reverseValue) {
+          request.result.reverse()
+        }
         resume(Effect.succeed(request.result))
       }
     })
@@ -928,7 +881,7 @@ const getSelect = Effect.fnUntraced(function*(
           cause: error
         })
     )
-  )
+  ) as Effect.Effect<Array<any>, IndexedDbQueryError, unknown>
 })
 
 const getFirst = Effect.fnUntraced(function*(
@@ -1036,7 +989,7 @@ const applyModify = Effect.fnUntraced(function*({
 
   return yield* Effect.callback<any, IndexedDbQueryError>((resume) => {
     const database = query.from.database
-    const transaction = query.from.transaction ?? database.transaction([query.from.table.tableName], "readwrite", {
+    const transaction = getOrCreateTransaction(database.current, [query.from.table.tableName], "readwrite", {
       durability: query.from.table.durability
     })
     const objectStore = transaction.objectStore(query.from.table.tableName)
@@ -1105,13 +1058,10 @@ const applyModifyAll = Effect.fnUntraced(
       IndexedDbQueryError
     >((resume) => {
       const database = query.from.database
-      const transaction = query.from.transaction
-      const objectStore = (
-        transaction ??
-          database.transaction([query.from.table.tableName], "readwrite", {
-            durability: query.from.table.durability
-          })
-      ).objectStore(query.from.table.tableName)
+      const transaction = getOrCreateTransaction(database.current, [query.from.table.tableName], "readwrite", {
+        durability: query.from.table.durability
+      })
+      const objectStore = transaction.objectStore(query.from.table.tableName)
 
       const results: Array<globalThis.IDBValidKey> = []
 
@@ -1187,12 +1137,11 @@ const applyModifyAll = Effect.fnUntraced(
 
 const applyClear = (options: {
   readonly database: globalThis.IDBDatabase
-  readonly transaction: globalThis.IDBTransaction | undefined
   readonly table: IndexedDbTable.AnyWithProps
 }) =>
   Effect.callback<void, IndexedDbQueryError>((resume) => {
     const database = options.database
-    const transaction = options.transaction ?? database.transaction([options.table.tableName], "readwrite", {
+    const transaction = getOrCreateTransaction(database, [options.table.tableName], "readwrite", {
       durability: options.table.durability
     })
     const objectStore = transaction.objectStore(options.table.tableName)
@@ -1217,12 +1166,11 @@ const applyClear = (options: {
 
 const applyClearAll = (options: {
   readonly database: globalThis.IDBDatabase
-  readonly transaction: globalThis.IDBTransaction | undefined
 }) =>
   Effect.callback<void, IndexedDbQueryError>((resume) => {
     const database = options.database
     const tables = database.objectStoreNames
-    const transaction = options.transaction ?? database.transaction([...tables], "readwrite")
+    const transaction = getOrCreateTransaction(database, [...tables], "readwrite")
 
     for (let t = 0; t < tables.length; t++) {
       const objectStore = transaction.objectStore(tables[t])
@@ -1329,8 +1277,7 @@ const FromProto: Omit<
   get clear() {
     const self = this as IndexedDbQuery.From<any>
     return applyClear({
-      database: self.database,
-      transaction: self.transaction,
+      database: self.database.current,
       table: self.table
     })
   }
@@ -1340,16 +1287,14 @@ const makeFrom = <
   const Table extends IndexedDbTable.AnyWithProps
 >(options: {
   readonly table: Table
-  readonly database: globalThis.IDBDatabase
+  readonly database: MutableRef.MutableRef<globalThis.IDBDatabase>
   readonly IDBKeyRange: typeof globalThis.IDBKeyRange
-  readonly transaction: globalThis.IDBTransaction | undefined
   readonly reactivity: Reactivity.Reactivity["Service"]
 }): IndexedDbQuery.From<Table> => {
   const self = Object.create(FromProto)
   self.table = options.table
   self.database = options.database
   self.IDBKeyRange = options.IDBKeyRange
-  self.transaction = options.transaction
   self.reactivity = options.reactivity
   return self
 }
@@ -1446,67 +1391,8 @@ const DeleteProto: Omit<
   },
   limit(this: IndexedDbQuery.Delete<any, never>, limit: number) {
     return makeDelete({
-      delete: this.delete,
-      only: this.only,
-      lowerBound: this.lowerBound,
-      upperBound: this.upperBound,
-      excludeLowerBound: this.excludeLowerBound ?? false,
-      excludeUpperBound: this.excludeUpperBound ?? false,
+      ...this,
       limitValue: limit
-    })
-  },
-  equals(this: IndexedDbQuery.Delete<any, never>, value: IndexedDbQuery.ExtractIndexType<any, never>) {
-    return makeDelete({
-      delete: this.delete,
-      only: value,
-      limitValue: this.limitValue
-    })
-  },
-  gte(this: IndexedDbQuery.Delete<any, never>, value: IndexedDbQuery.ExtractIndexType<any, never>) {
-    return makeDelete({
-      delete: this.delete,
-      lowerBound: value,
-      excludeLowerBound: false,
-      limitValue: this.limitValue
-    })
-  },
-  lte(this: IndexedDbQuery.Delete<any, never>, value: IndexedDbQuery.ExtractIndexType<any, never>) {
-    return makeDelete({
-      delete: this.delete,
-      upperBound: value,
-      excludeUpperBound: false,
-      limitValue: this.limitValue
-    })
-  },
-  gt(this: IndexedDbQuery.Delete<any, never>, value: IndexedDbQuery.ExtractIndexType<any, never>) {
-    return makeDelete({
-      delete: this.delete,
-      lowerBound: value,
-      excludeLowerBound: true,
-      limitValue: this.limitValue
-    })
-  },
-  lt(this: IndexedDbQuery.Delete<any, never>, value: IndexedDbQuery.ExtractIndexType<any, never>) {
-    return makeDelete({
-      delete: this.delete,
-      upperBound: value,
-      excludeUpperBound: true,
-      limitValue: this.limitValue
-    })
-  },
-  between(
-    this: IndexedDbQuery.Delete<any, never>,
-    lowerBound: IndexedDbQuery.ExtractIndexType<any, never>,
-    upperBound: IndexedDbQuery.ExtractIndexType<any, never>,
-    queryOptions?: { excludeLowerBound?: boolean; excludeUpperBound?: boolean }
-  ) {
-    return makeDelete({
-      delete: this.delete,
-      lowerBound,
-      upperBound,
-      excludeLowerBound: queryOptions?.excludeLowerBound ?? false,
-      excludeUpperBound: queryOptions?.excludeUpperBound ?? false,
-      limitValue: this.limitValue
     })
   },
   filter(this: IndexedDbQuery.Delete<any, never>, filter: (value: IndexedDbTable.Encoded<any>) => boolean) {
@@ -1550,8 +1436,8 @@ const makeDelete = <
   self.only = options.only
   self.lowerBound = options.lowerBound
   self.upperBound = options.upperBound
-  self.excludeLowerBound = options.excludeLowerBound
-  self.excludeUpperBound = options.excludeUpperBound
+  self.excludeLowerBound = options.excludeLowerBound ?? false
+  self.excludeUpperBound = options.excludeUpperBound ?? false
   self.predicate = options.predicate
   return self
 }
@@ -1574,8 +1460,7 @@ const CountProto: Omit<
     return makeCount({
       from: this.from,
       index: this.index,
-      only: value,
-      limitValue: this.limitValue
+      only: value
     })
   },
   gte(this: IndexedDbQuery.Count<any, never>, value: IndexedDbQuery.ExtractIndexType<any, never>) {
@@ -1583,8 +1468,7 @@ const CountProto: Omit<
       from: this.from,
       index: this.index,
       lowerBound: value,
-      excludeLowerBound: false,
-      limitValue: this.limitValue
+      excludeLowerBound: false
     })
   },
   lte(this: IndexedDbQuery.Count<any, never>, value: IndexedDbQuery.ExtractIndexType<any, never>) {
@@ -1592,8 +1476,7 @@ const CountProto: Omit<
       from: this.from,
       index: this.index,
       upperBound: value,
-      excludeUpperBound: false,
-      limitValue: this.limitValue
+      excludeUpperBound: false
     })
   },
   gt(this: IndexedDbQuery.Count<any, never>, value: IndexedDbQuery.ExtractIndexType<any, never>) {
@@ -1601,8 +1484,7 @@ const CountProto: Omit<
       from: this.from,
       index: this.index,
       lowerBound: value,
-      excludeLowerBound: true,
-      limitValue: this.limitValue
+      excludeLowerBound: true
     })
   },
   lt(this: IndexedDbQuery.Count<any, never>, value: IndexedDbQuery.ExtractIndexType<any, never>) {
@@ -1610,8 +1492,7 @@ const CountProto: Omit<
       from: this.from,
       index: this.index,
       upperBound: value,
-      excludeUpperBound: true,
-      limitValue: this.limitValue
+      excludeUpperBound: true
     })
   },
   between(
@@ -1626,8 +1507,7 @@ const CountProto: Omit<
       lowerBound,
       upperBound,
       excludeLowerBound: queryOptions?.excludeLowerBound ?? false,
-      excludeUpperBound: queryOptions?.excludeUpperBound ?? false,
-      limitValue: this.limitValue
+      excludeUpperBound: queryOptions?.excludeUpperBound ?? false
     })
   }
 }
@@ -1638,7 +1518,6 @@ const makeCount = <
 >(options: {
   readonly from: IndexedDbQuery.From<Table>
   readonly index: Index | undefined
-  readonly limitValue?: number | undefined
   readonly only?: IndexedDbQuery.ExtractIndexType<Table, Index> | undefined
   readonly lowerBound?:
     | IndexedDbQuery.ExtractIndexType<Table, Index>
@@ -1653,7 +1532,6 @@ const makeCount = <
   self.from = options.from
   self.index = options.index
   self.only = options.only
-  self.limitValue = options.limitValue
   self.lowerBound = options.lowerBound
   self.upperBound = options.upperBound
   self.excludeLowerBound = options.excludeLowerBound
@@ -1666,6 +1544,7 @@ const SelectProto: Omit<
   | "from"
   | "index"
   | "limitValue"
+  | "reverseValue"
   | "only"
   | "lowerBound"
   | "upperBound"
@@ -1677,6 +1556,12 @@ const SelectProto: Omit<
     return makeSelect({
       ...this,
       limitValue: limit
+    })
+  },
+  offset(this: IndexedDbQuery.Select<any, never>, offset: number) {
+    return makeSelect({
+      ...this,
+      offsetValue: offset
     })
   },
   equals(this: IndexedDbQuery.Select<any, never>, value: IndexedDbQuery.ExtractIndexType<any, never>) {
@@ -1727,6 +1612,12 @@ const SelectProto: Omit<
       excludeUpperBound: queryOptions?.excludeUpperBound ?? false
     })
   },
+  reverse(this: IndexedDbQuery.Select<any, never>) {
+    return makeSelect({
+      ...this,
+      reverseValue: true
+    })
+  },
   first(this: IndexedDbQuery.Select<any, never>) {
     return makeFirst({ select: this })
   },
@@ -1738,7 +1629,28 @@ const SelectProto: Omit<
     })
   },
   asEffect(this: IndexedDbQuery.Select<any, never>) {
-    return getSelect(this) as any
+    return applySelect(this) as any
+  },
+  stream(this: IndexedDbQuery.Select<any, never>, options?: {
+    readonly chunkSize?: number | undefined
+  }) {
+    const limit = this.limitValue
+    const chunkSize = Math.min(options?.chunkSize ?? 100, limit ?? Number.MAX_SAFE_INTEGER)
+    const initial = this.limit(chunkSize)
+    return Stream.suspend(() => {
+      let total = 0
+      return Stream.paginate(initial, (select) =>
+        Effect.map(
+          applySelect(select as any),
+          (data) => {
+            total += data.length
+            ;(select as any).offsetValue = total
+            const reachedLimit = limit && total >= limit
+            const isPartial = data.length < chunkSize
+            return [data, isPartial || reachedLimit ? Option.none() : Option.some(select)] as const
+          }
+        ))
+    })
   },
   reactive(
     this: IndexedDbQuery.Select<any, never>,
@@ -1763,6 +1675,8 @@ const makeSelect = <
   readonly from: IndexedDbQuery.From<Table>
   readonly index?: Index | undefined
   readonly limitValue?: number | undefined
+  readonly offsetValue?: number | undefined
+  readonly reverseValue?: boolean | undefined
   readonly only?: IndexedDbQuery.ExtractIndexType<Table, Index> | undefined
   readonly lowerBound?:
     | IndexedDbQuery.ExtractIndexType<Table, Index>
@@ -1779,6 +1693,8 @@ const makeSelect = <
   self.index = options.index
   self.only = options.only
   self.limitValue = options.limitValue
+  self.offsetValue = options.offsetValue
+  self.reverseValue = options.reverseValue
   self.lowerBound = options.lowerBound
   self.upperBound = options.upperBound
   self.excludeLowerBound = options.excludeLowerBound
@@ -1904,7 +1820,7 @@ const QueryBuilderProto: Omit<
   ...CommonProto,
   use(this: IndexedDbQueryBuilder<any>, f: (database: globalThis.IDBDatabase) => any) {
     return Effect.try({
-      try: () => f(this.database),
+      try: () => f(this.database.current),
       catch: (error) =>
         new IndexedDbQueryError({
           reason: "UnknownError",
@@ -1917,41 +1833,27 @@ const QueryBuilderProto: Omit<
       database: this.database,
       IDBKeyRange: this.IDBKeyRange,
       table: this.tables.get(table)!,
-      transaction: this.IDBTransaction,
       reactivity: this.reactivity
     }) as any
   },
   get clearAll() {
     const self = this as IndexedDbQueryBuilder<any>
-    return applyClearAll({ database: self.database, transaction: self.IDBTransaction })
+    return applyClearAll({ database: self.database.current })
   },
-  transaction: Effect.fnUntraced(function*<E, R>(
-    this: IndexedDbQueryBuilder<any>,
-    transactionTables: Array<
-      IndexedDbTable.TableName<IndexedDbVersion.Tables<any>>
-    >,
-    mode: globalThis.IDBTransactionMode,
-    callback: (api: {
-      readonly from: <
-        Name extends IndexedDbTable.TableName<IndexedDbVersion.Tables<any>>
-      >(
-        table: Name
-      ) => IndexedDbQuery.From<IndexedDbVersion.TableWithName<any, Name>>
-    }) => Effect.Effect<void, E, R>,
-    options?: globalThis.IDBTransactionOptions
-  ) {
-    const transaction = this.database.transaction(transactionTables, mode, options)
-    return yield* callback({
-      from: (table) =>
-        makeFrom({
-          database: this.database,
-          IDBKeyRange: this.IDBKeyRange,
-          table: this.tables.get(table) as any,
-          transaction,
-          reactivity: this.reactivity
-        })
-    })
-  }) as any
+  withTransaction(this: IndexedDbQueryBuilder<any>, options: {
+    readonly tables: NonEmptyReadonlyArray<any>
+    readonly mode: globalThis.IDBTransactionMode
+    readonly durability?: IDBTransactionDurability
+  }) {
+    return (effect) =>
+      Effect.suspend(() => {
+        const transaction = this.database.current.transaction(options.tables, options.mode, options)
+        return Effect.provideService(effect, IndexedDbTransaction, transaction)
+      }).pipe(
+        // To prevent async gaps between transaction queries
+        Effect.provideService(References.PreventSchedulerYield, true)
+      )
+  }
 }
 
 /**
@@ -1962,13 +1864,11 @@ export const make = <Source extends IndexedDbVersion.AnyWithProps>({
   IDBKeyRange,
   database,
   tables,
-  transaction,
   reactivity
 }: {
-  readonly database: globalThis.IDBDatabase
+  readonly database: MutableRef.MutableRef<globalThis.IDBDatabase>
   readonly IDBKeyRange: typeof globalThis.IDBKeyRange
   readonly tables: ReadonlyMap<string, IndexedDbVersion.Tables<Source>>
-  readonly transaction: globalThis.IDBTransaction | undefined
   readonly reactivity: Reactivity.Reactivity["Service"]
 }): IndexedDbQueryBuilder<Source> => {
   const self = Object.create(QueryBuilderProto)
@@ -1976,6 +1876,15 @@ export const make = <Source extends IndexedDbVersion.AnyWithProps>({
   self.database = database
   self.reactivity = reactivity
   self.IDBKeyRange = IDBKeyRange
-  self.IDBTransaction = transaction
   return self
+}
+
+const getOrCreateTransaction = (
+  database: globalThis.IDBDatabase,
+  tables: ReadonlyArray<string>,
+  mode: globalThis.IDBTransactionMode,
+  options?: IDBTransactionOptions
+) => {
+  const fiber = Fiber.getCurrent()!
+  return Context.getOrUndefined(fiber.context, IndexedDbTransaction) ?? database.transaction(tables, mode, options)
 }
